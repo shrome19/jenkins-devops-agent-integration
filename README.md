@@ -97,13 +97,19 @@ your shell history:
 SECRET_ARN=$(aws cloudformation describe-stacks --stack-name jenkins-devops-agent \
   --query "Stacks[0].Outputs[?OutputKey=='WebhookSecretArn'].OutputValue" --output text)
 
-read -r  -p "Webhook URL: " WEBHOOK_URL
-read -rs -p "Webhook signing secret: " WEBHOOK_SECRET; echo
+# Prompts work in both bash and zsh (zsh's `read -p` means something else).
+printf 'Webhook URL: ';            read -r  WEBHOOK_URL
+printf 'Webhook signing secret: '; read -rs WEBHOOK_SECRET; echo
 
 umask 077; TMP=$(mktemp)
 jq -n --arg u "$WEBHOOK_URL" --arg s "$WEBHOOK_SECRET" \
   '{webhookUrl: $u, webhookSecret: $s}' > "$TMP"
-aws secretsmanager put-secret-value --secret-id "$SECRET_ARN" --secret-string "file://$TMP"
+# Refuse to store empty or non-https values.
+if jq -e '(.webhookUrl | startswith("https://")) and (.webhookSecret | length > 0)' "$TMP" >/dev/null; then
+  aws secretsmanager put-secret-value --secret-id "$SECRET_ARN" --secret-string "file://$TMP"
+else
+  echo "Webhook URL must start with https:// and the secret can't be empty; nothing stored."
+fi
 rm -f "$TMP"; unset WEBHOOK_SECRET
 ```
 
@@ -229,7 +235,7 @@ milliseconds) in `x-amzn-event-timestamp`. Sign the exact bytes you send.
 | Symptom | Likely cause |
 |---------|--------------|
 | `HTTP 403` from the Function URL | Request not SigV4-signed, signed for the wrong region/service (must be `lambda`), or signed by a principal other than `JenkinsPrincipalArn`. Cross-account callers also need the identity policy from step 5. |
-| `HTTP 500 Forwarder not configured` | The secret still has placeholder values, or the URL isn't `https://` (step 3). |
+| `HTTP 500 Forwarder not configured` | The secret has placeholder or empty values, or the URL isn't `https://`. Redo step 3. (If you saw `read: -p: no coprocess`, your shell is zsh and an older version of these prompts stored empty values.) |
 | `HTTP 502 ... returned 401/403` | Webhook URL or signing secret doesn't match the Agent Space webhook. Reload the secret, then wait for the 5-minute cache. |
 | `HTTP 502 ... returned 400` | The webhook rejected the payload. Check the forwarder's CloudWatch logs for the response body. |
 | `HTTP 413` | Request body over 64 KB. Send fewer log lines. |
