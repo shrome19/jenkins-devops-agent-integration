@@ -64,6 +64,17 @@ Secrets Manager in step 3; don't put them in Jenkins.
 
 ### 2. Deploy the forwarder stack
 
+`JenkinsPrincipalArn` is the IAM role Jenkins runs as. If you're signed in as that
+role (for example, testing from a laptop that assumes the same role), you can look it
+up from your current credentials:
+
+```bash
+ROLE_NAME=$(aws sts get-caller-identity --query Arn --output text | cut -d/ -f2)
+aws iam get-role --role-name "$ROLE_NAME" --query Role.Arn --output text
+```
+
+Deploy:
+
 ```bash
 aws cloudformation deploy \
   --template-file template.yaml \
@@ -113,8 +124,15 @@ fi
 rm -f "$TMP"; unset WEBHOOK_SECRET
 ```
 
-The Lambda caches the secret for up to 5 minutes. After you rotate it, wait that
-long or redeploy the function.
+The Lambda caches the secret for up to 5 minutes. After you change it, either wait
+that long or force a reload. Any configuration change starts fresh Lambda instances:
+
+```bash
+FN=$(aws cloudformation describe-stacks --stack-name jenkins-devops-agent \
+  --query "Stacks[0].Outputs[?OutputKey=='FunctionName'].OutputValue" --output text)
+aws lambda update-function-configuration --function-name "$FN" \
+  --description "reload $(date +%s)" --query LastUpdateStatus
+```
 
 ### 4. Test without Jenkins
 
@@ -168,6 +186,20 @@ last 50 lines. This needs no Jenkins script approvals.
 
 Notification is best effort. If the forwarder can't be reached, the post block logs
 why and doesn't error.
+
+**Trying the example as-is:** paste `examples/Jenkinsfile` into a Pipeline job,
+set `DEVOPS_AGENT_ENDPOINT`, and click **Build Now**. `./build.sh` and `./deploy.sh`
+are placeholders, so the Build stage fails on purpose with
+`./build.sh: No such file or directory` and the build ends with
+`script returned exit code 127`. That failure is the test. The console should show:
+
+```
+DevOps Agent forwarder responded HTTP 200
+{"message":"Investigation triggered","incidentId":"jenkins-<job>-<build>-<timestamp>"}
+```
+
+and a new investigation appears in your Agent Space with the "not found" line as its
+error text.
 
 ## Payload fields
 
@@ -244,6 +276,45 @@ milliseconds) in `x-amzn-event-timestamp`. Sign the exact bytes you send.
 | `export-credentials` not found | AWS CLI older than 2.9. |
 
 Forwarder logs: CloudWatch Logs group `/aws/lambda/<FunctionName>`.
+
+```bash
+aws logs tail "/aws/lambda/$FN" --since 15m | grep -i "rejected\|error"
+```
+
+**Checking the webhook secret directly.** If the forwarder reports
+`DevOps Agent webhook returned 403`, find out whether the stored secret is wrong
+or the forwarder is at fault by signing a minimal event from your laptop with the
+same secret. No Lambda is involved:
+
+```bash
+S=$(aws secretsmanager get-secret-value --secret-id "$SECRET_ARN" --query SecretString --output text)
+URL=$(echo "$S" | jq -r .webhookUrl); KEY=$(echo "$S" | jq -r .webhookSecret); unset S
+TS=$(date -u +%Y-%m-%dT%H:%M:%S.000Z)
+jq -nc --arg ts "$TS" '{eventType:"incident",incidentId:("direct-test-"+($ts|gsub("[^0-9]";""))),action:"created",priority:"LOW",title:"Direct webhook signing test",description:"Signing test",timestamp:$ts,service:"Jenkins",data:{}}' > /tmp/p.json
+SIG=$( { printf '%s:' "$TS"; cat /tmp/p.json; } | openssl dgst -sha256 -hmac "$KEY" -binary | base64 ); unset KEY
+curl -sS -X POST "$URL" -H 'Content-Type: application/json' -H "x-amzn-event-timestamp: $TS" \
+  -H "x-amzn-event-signature: $SIG" --data-binary @/tmp/p.json -w '\nHTTP %{http_code}\n'; rm -f /tmp/p.json
+```
+
+- `HTTP 403`: the stored URL or secret doesn't match the Agent Space webhook. Reload
+  it (step 3).
+- `HTTP 200`: the secret is fine. If the forwarder failed right after you changed the
+  secret, retry, because the change can take a few seconds to show up. Otherwise
+  force a reload (end of step 3).
+
+A `200` creates a real low-priority investigation, which you can close.
+
+## Tested with
+
+End-to-end (Jenkins build failure → forwarder → new DevOps Agent investigation) in
+`us-east-1` with:
+
+- Jenkins LTS (`jenkins/jenkins:lts-jdk17` container, Debian 13, `/bin/sh` = dash),
+  declarative pipeline pasted as a Pipeline script, with no script approvals needed
+- curl 8.14.1 and AWS CLI 2.38.1 on the Jenkins controller
+- AWS credentials supplied to Jenkins as temporary environment variables (same
+  account as the forwarder)
+- Forwarder on the `nodejs22.x` Lambda runtime
 
 ## Cleanup
 

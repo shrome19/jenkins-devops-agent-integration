@@ -10,6 +10,10 @@
 
 import groovy.json.JsonOutput
 
+// ./build.sh and ./deploy.sh are placeholders for your real steps. Run as-is, the
+// Build stage fails on purpose ("No such file or directory", exit code 127), which
+// is a quick way to test the notification end to end.
+
 // Records which stage failed. Each stage's post-failure block sets it.
 def failedStage = 'unknown'
 
