@@ -1,0 +1,119 @@
+// Example: notify AWS DevOps Agent when a Jenkins build fails.
+//
+// The only parts you need to copy into your own pipeline are:
+//   1. the `failedStage` variable + the per-stage `post { failure { ... } }` blocks
+//   2. the pipeline-level `post { failure { ... } }` block
+//
+// Requirements on the Jenkins agent: AWS CLI v2 (>= 2.9), curl (>= 7.75), and AWS
+// credentials for the IAM principal you passed as JenkinsPrincipalArn when deploying
+// template.yaml (instance profile / IRSA / AWS Credentials plugin — see README).
+
+import groovy.json.JsonOutput
+
+// Records which stage failed. Each stage's post-failure block sets it.
+def failedStage = 'unknown'
+
+pipeline {
+  agent any
+
+  environment {
+    // ForwarderEndpoint output of the CloudFormation stack. Not a secret: the URL
+    // only accepts SigV4-signed requests from the allowed IAM principal.
+    DEVOPS_AGENT_ENDPOINT = 'https://<url-id>.lambda-url.us-east-1.on.aws/'
+    AWS_REGION            = 'us-east-1'   // region the forwarder stack is deployed in
+    TARGET_ENVIRONMENT    = 'prod'        // shown to the agent; drives your own triage
+  }
+
+  stages {
+    stage('Build') {
+      steps {
+        // pipefail + tee keeps the real exit code AND saves output for the agent.
+        sh '''#!/bin/bash
+          set -o pipefail
+          ./build.sh 2>&1 | tee stage.log
+        '''
+      }
+      post { failure { script { failedStage = env.STAGE_NAME } } }
+    }
+
+    stage('Deploy') {
+      steps {
+        sh '''#!/bin/bash
+          set -o pipefail
+          ./deploy.sh 2>&1 | tee stage.log
+        '''
+      }
+      post { failure { script { failedStage = env.STAGE_NAME } } }
+    }
+  }
+
+  post {
+    failure {
+      script {
+        // Last 50 lines of the failing stage's output, if it was captured.
+        def errorLog = fileExists('stage.log')
+          ? sh(script: 'tail -n 50 stage.log', returnStdout: true).trim()
+          : ''
+
+        def causes = currentBuild.getBuildCauses()
+        def payload = [
+          jobName    : env.JOB_NAME,
+          buildNumber: env.BUILD_NUMBER,
+          buildUrl   : env.BUILD_URL,
+          status     : currentBuild.currentResult,
+          failedStage: failedStage,
+          branch     : env.GIT_BRANCH ?: '',
+          repository : env.GIT_URL ?: '',
+          triggeredBy: causes ? causes[0].shortDescription : '',
+          duration   : currentBuild.durationString,
+          errorLog   : errorLog,
+          environment: env.TARGET_ENVIRONMENT,
+          awsRegion  : env.AWS_REGION,
+          priority   : 'HIGH',
+          // Anything that helps the agent find the right resources.
+          context    : [service: 'my-app', cluster: 'example-cluster', namespace: 'production']
+        ]
+
+        // JsonOutput escapes quotes/newlines in the log, so the body is always valid JSON.
+        writeFile file: 'devops-agent-payload.json', text: JsonOutput.toJson(payload)
+
+        // Notification is best effort: log a failure to notify, don't throw from post.
+        try {
+        // Jenkins runs `sh` with -x by default; turn it off first so credentials are
+        // never echoed into the console log.
+        sh '''
+          set +x
+          set -eu
+
+          # Resolve credentials from whatever the agent uses (instance profile, IRSA,
+          # SSO, or env vars from the AWS Credentials plugin).
+          eval "$(aws configure export-credentials --format env)"
+
+          # Pass credentials to curl through a private config file, not argv, so they
+          # don't show up in the process list.
+          umask 077
+          CURL_CFG=$(mktemp)
+          trap 'rm -f "$CURL_CFG"' EXIT
+          printf 'user = "%s:%s"\n' "$AWS_ACCESS_KEY_ID" "$AWS_SECRET_ACCESS_KEY" > "$CURL_CFG"
+          if [ -n "${AWS_SESSION_TOKEN:-}" ]; then
+            printf 'header = "x-amz-security-token: %s"\n' "$AWS_SESSION_TOKEN" >> "$CURL_CFG"
+          fi
+
+          HTTP_CODE=$(curl -sS -K "$CURL_CFG" \
+            --aws-sigv4 "aws:amz:${AWS_REGION}:lambda" \
+            -H 'Content-Type: application/json' \
+            --data-binary @devops-agent-payload.json \
+            -o devops-agent-response.json -w '%{http_code}' \
+            "$DEVOPS_AGENT_ENDPOINT")
+
+          echo "DevOps Agent forwarder responded HTTP $HTTP_CODE"
+          cat devops-agent-response.json; echo
+          case "$HTTP_CODE" in 2*) ;; *) exit 1 ;; esac
+        '''
+        } catch (err) {
+          echo "Could not notify AWS DevOps Agent (see output above): ${err}"
+        }
+      }
+    }
+  }
+}

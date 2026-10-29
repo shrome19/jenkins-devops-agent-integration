@@ -1,0 +1,6 @@
+.DS_Store
+*.zip
+node_modules/
+devops-agent-payload.json
+devops-agent-response.json
+stage.log

@@ -1,0 +1,261 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  Jenkins -> AWS DevOps Agent integration (sample). Creates an IAM-authenticated
+  Lambda Function URL that Jenkins calls when a build fails. The Lambda reshapes the
+  build details into the DevOps Agent incident schema, HMAC-signs it, and forwards it
+  to your Agent Space webhook, which starts an investigation.
+
+Parameters:
+  JenkinsPrincipalArn:
+    Type: String
+    Description: >
+      ARN of the IAM role (or user) Jenkins uses to call AWS, e.g. the EC2 instance
+      profile role of the Jenkins agent. Only this principal can invoke the endpoint.
+    AllowedPattern: '^arn:aws[a-zA-Z-]*:iam::\d{12}:(role|user)/.+$'
+    ConstraintDescription: Must be an IAM role or user ARN.
+
+Resources:
+
+  # Holds the Agent Space webhook URL + HMAC secret. Created with placeholder values so
+  # the real secret never passes through CloudFormation parameters or stack events.
+  # Load the real values after deploy (see README, step 3). The Lambda fails closed
+  # until you do.
+  WebhookSecret:
+    Type: AWS::SecretsManager::Secret
+    Properties:
+      Name: !Sub '${AWS::StackName}/devops-agent-webhook'
+      Description: DevOps Agent webhook URL and HMAC signing secret
+      SecretString: '{"webhookUrl":"REPLACE_ME","webhookSecret":"REPLACE_ME"}'
+
+  ForwarderRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - !Sub 'arn:${AWS::Partition}:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole'
+      Policies:
+        - PolicyName: ReadWebhookSecret
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: secretsmanager:GetSecretValue
+                Resource: !Ref WebhookSecret
+
+  ForwarderFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      Description: Forwards Jenkins build failures to the AWS DevOps Agent webhook
+      Runtime: nodejs22.x
+      Handler: index.handler
+      Timeout: 30
+      MemorySize: 256
+      Role: !GetAtt ForwarderRole.Arn
+      Environment:
+        Variables:
+          SECRET_ARN: !Ref WebhookSecret
+      Code:
+        ZipFile: |
+          "use strict";
+          // Request authentication is done by Lambda itself (Function URL AuthType
+          // AWS_IAM + SigV4). By the time this handler runs, the caller has already
+          // been verified as the allowed Jenkins IAM principal.
+          const { SecretsManagerClient, GetSecretValueCommand } = require("@aws-sdk/client-secrets-manager");
+          const { createHmac } = require("node:crypto");
+
+          const sm = new SecretsManagerClient({});
+          const SECRET_TTL_MS = 5 * 60 * 1000;
+          const MAX_BODY_BYTES = 64 * 1024;
+          const MAX_ERROR_LOG_CHARS = 2000;
+          const MAX_CONTEXT_CHARS = 2000;
+          // Stay under the DevOps Agent webhook payload limit (10,000 characters).
+          const MAX_PAYLOAD_CHARS = 9500;
+          const PRIORITIES = new Set(["CRITICAL", "HIGH", "MEDIUM", "LOW"]);
+
+          let cached = null;
+          let cachedAt = 0;
+
+          async function getWebhookConfig() {
+            if (cached && Date.now() - cachedAt < SECRET_TTL_MS) return cached;
+            const resp = await sm.send(new GetSecretValueCommand({ SecretId: process.env.SECRET_ARN }));
+            const value = JSON.parse(resp.SecretString || "{}");
+            // Fail closed until real values are loaded.
+            if (!value.webhookUrl || !value.webhookSecret ||
+                value.webhookUrl === "REPLACE_ME" || value.webhookSecret === "REPLACE_ME") {
+              throw new Error("Webhook secret not configured");
+            }
+            if (!/^https:\/\//.test(value.webhookUrl)) {
+              throw new Error("webhookUrl must be https");
+            }
+            cached = value;
+            cachedAt = Date.now();
+            return cached;
+          }
+
+          // Coerce any field to a bounded string so a malformed request can't bloat the payload.
+          function str(v, max = 512) {
+            if (v === undefined || v === null) return "";
+            return String(v).slice(0, max);
+          }
+
+          function reply(statusCode, obj) {
+            return { statusCode, headers: { "Content-Type": "application/json" }, body: JSON.stringify(obj) };
+          }
+
+          exports.handler = async (event) => {
+            const raw = event.isBase64Encoded
+              ? Buffer.from(event.body || "", "base64").toString("utf8")
+              : (event.body || "");
+            if (Buffer.byteLength(raw, "utf8") > MAX_BODY_BYTES) {
+              return reply(413, { error: "Payload too large" });
+            }
+
+            let body;
+            try {
+              body = JSON.parse(raw);
+            } catch {
+              return reply(400, { error: "Invalid JSON" });
+            }
+            if (!body || typeof body !== "object" || Array.isArray(body)) {
+              return reply(400, { error: "Body must be a JSON object" });
+            }
+
+            const jobName = str(body.jobName, 200) || "unknown-job";
+            const buildNumber = str(body.buildNumber, 20) || "0";
+            const buildUrl = str(body.buildUrl, 500);
+            const buildStatus = str(body.status, 20) || "FAILURE";
+            const failedStage = str(body.failedStage, 200) || "unknown";
+            const branch = str(body.branch, 200);
+            const repository = str(body.repository, 500);
+            const triggeredBy = str(body.triggeredBy, 200);
+            const duration = str(body.duration, 50);
+            const errorLog = str(body.errorLog, MAX_ERROR_LOG_CHARS);
+            const environment = str(body.environment, 50) || "unknown";
+            const priorityIn = str(body.priority, 20).toUpperCase();
+            const priority = PRIORITIES.has(priorityIn) ? priorityIn : "HIGH";
+            let context = (body.context && typeof body.context === "object" && !Array.isArray(body.context))
+              ? body.context : {};
+            if (JSON.stringify(context).length > MAX_CONTEXT_CHARS) {
+              context = { truncated: true, note: `context exceeded ${MAX_CONTEXT_CHARS} characters and was dropped` };
+            }
+
+            const incidentId = `jenkins-${jobName.replace(/[^a-zA-Z0-9]/g, "-")}-${buildNumber}-${Date.now()}`;
+
+            // DevOps Agent generic webhook expects the incident schema; custom fields go under `data`.
+            // The error log goes in `description` only (not duplicated under data) to save space.
+            const buildPayload = (log) => JSON.stringify({
+              eventType: "incident",
+              incidentId,
+              action: "created",
+              priority,
+              title: `FAILED: ${jobName} #${buildNumber} (Jenkins)`,
+              description: [
+                `Jenkins job "${jobName}" build #${buildNumber} ${buildStatus}.`,
+                failedStage !== "unknown" ? `Failed in stage: ${failedStage}` : "",
+                branch ? `Branch: ${branch}` : "",
+                repository ? `Repository: ${repository}` : "",
+                buildUrl ? `Build URL: ${buildUrl}` : "",
+                log ? `Error (last lines):\n${log}` : "",
+              ].filter(Boolean).join("\n"),
+              timestamp: new Date().toISOString(),
+              service: "Jenkins",
+              data: {
+                metadata: {
+                  region: str(body.awsRegion, 30) || process.env.AWS_REGION,
+                  environment,
+                },
+                jenkins: {
+                  jobName, buildNumber, buildUrl, buildStatus, failedStage,
+                  duration, triggeredBy, branch, repository,
+                },
+                context,
+              },
+            });
+
+            // Final guard: if still too large, keep the most recent part of the log.
+            let payload = buildPayload(errorLog);
+            if (payload.length > MAX_PAYLOAD_CHARS) {
+              const overflow = payload.length - MAX_PAYLOAD_CHARS;
+              payload = buildPayload(errorLog.slice(Math.min(errorLog.length, overflow + 50)));
+            }
+
+            let cfg;
+            try {
+              cfg = await getWebhookConfig();
+            } catch (e) {
+              console.error("Config error:", e.message);
+              return reply(500, { error: "Forwarder not configured" });
+            }
+
+            // Signature = base64(HMAC-SHA256(secret, "<timestamp>:<body>")), timestamp in ISO-8601 with ms.
+            const sigTimestamp = new Date().toISOString();
+            const signature = createHmac("sha256", cfg.webhookSecret)
+              .update(`${sigTimestamp}:${payload}`, "utf8")
+              .digest("base64");
+
+            let resp;
+            try {
+              resp = await fetch(cfg.webhookUrl, {
+                method: "POST",
+                headers: {
+                  "Content-Type": "application/json",
+                  "x-amzn-event-timestamp": sigTimestamp,
+                  "x-amzn-event-signature": signature,
+                },
+                body: payload,
+                signal: AbortSignal.timeout(20000),
+              });
+            } catch (e) {
+              console.error("Webhook request failed:", e.message);
+              return reply(502, { error: "Could not reach DevOps Agent webhook" });
+            }
+
+            if (!resp.ok) {
+              console.error(`Webhook rejected: ${resp.status} ${await resp.text()}`);
+              return reply(502, { error: `DevOps Agent webhook returned ${resp.status}` });
+            }
+
+            console.log(`Investigation triggered: ${incidentId}`);
+            return reply(200, { message: "Investigation triggered", incidentId });
+          };
+
+  # IAM-authenticated endpoint. Callers must sign requests with SigV4.
+  ForwarderUrl:
+    Type: AWS::Lambda::Url
+    Properties:
+      AuthType: AWS_IAM
+      TargetFunctionArn: !GetAtt ForwarderFunction.Arn
+
+  # Function URL callers need BOTH permissions below.
+  AllowJenkinsInvokeUrl:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref ForwarderFunction
+      Action: lambda:InvokeFunctionUrl
+      Principal: !Ref JenkinsPrincipalArn
+      FunctionUrlAuthType: AWS_IAM
+
+  AllowJenkinsInvokeViaUrl:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref ForwarderFunction
+      Action: lambda:InvokeFunction
+      Principal: !Ref JenkinsPrincipalArn
+      InvokedViaFunctionUrl: true
+
+Outputs:
+  ForwarderEndpoint:
+    Description: IAM-authenticated URL Jenkins POSTs build failures to
+    Value: !GetAtt ForwarderUrl.FunctionUrl
+  WebhookSecretArn:
+    Description: Secret to load the DevOps Agent webhook URL and HMAC secret into
+    Value: !Ref WebhookSecret
+  FunctionName:
+    Description: Forwarder Lambda (check its CloudWatch logs when testing)
+    Value: !Ref ForwarderFunction

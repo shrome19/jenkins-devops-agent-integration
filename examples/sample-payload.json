@@ -1,0 +1,20 @@
+{
+  "jobName": "example-app-deploy",
+  "buildNumber": "42",
+  "buildUrl": "https://jenkins.example.com/job/example-app-deploy/42/",
+  "status": "FAILURE",
+  "failedStage": "Deploy",
+  "branch": "main",
+  "repository": "https://github.com/example-org/example-app",
+  "triggeredBy": "Started by user admin",
+  "duration": "2 min 14 sec",
+  "errorLog": "deployment \"example-app\" exceeded its progress deadline\nerror: rollout status: timed out waiting for the condition",
+  "environment": "prod",
+  "awsRegion": "us-east-1",
+  "priority": "HIGH",
+  "context": {
+    "cluster": "example-cluster",
+    "namespace": "production",
+    "deployment": "example-app"
+  }
+}
