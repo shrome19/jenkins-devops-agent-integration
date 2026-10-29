@@ -86,8 +86,13 @@ pipeline {
           set -eu
 
           # Resolve credentials from whatever the agent uses (instance profile, IRSA,
-          # SSO, or env vars from the AWS Credentials plugin).
-          eval "$(aws configure export-credentials --format env)"
+          # SSO, or env vars from the AWS Credentials plugin). Stop with a clear
+          # message if there are none; otherwise curl fails with a cryptic exit code.
+          if ! CREDS=$(aws configure export-credentials --format env); then
+            echo "No AWS credentials available to this Jenkins agent; can't sign the request (README step 5)."
+            exit 1
+          fi
+          eval "$CREDS"; unset CREDS
 
           # Pass credentials to curl through a private config file, not argv, so they
           # don't show up in the process list.

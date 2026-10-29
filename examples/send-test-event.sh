@@ -12,7 +12,11 @@ ENDPOINT="${1:?usage: $0 <ForwarderEndpoint> [region] [payload.json]}"
 REGION="${2:-us-east-1}"
 PAYLOAD="${3:-$(dirname "$0")/sample-payload.json}"
 
-eval "$(aws configure export-credentials --format env)"
+if ! CREDS=$(aws configure export-credentials --format env); then
+  echo "No AWS credentials found; sign in or export credentials for the Jenkins principal first." >&2
+  exit 1
+fi
+eval "$CREDS"; unset CREDS
 
 umask 077
 CURL_CFG=$(mktemp)

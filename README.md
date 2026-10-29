@@ -239,6 +239,7 @@ milliseconds) in `x-amzn-event-timestamp`. Sign the exact bytes you send.
 | `HTTP 502 ... returned 401/403` | Webhook URL or signing secret doesn't match the Agent Space webhook. Reload the secret, then wait for the 5-minute cache. |
 | `HTTP 502 ... returned 400` | The webhook rejected the payload. Check the forwarder's CloudWatch logs for the response body. |
 | `HTTP 413` | Request body over 64 KB. Send fewer log lines. |
+| `No AWS credentials available to this Jenkins agent` | Jenkins can't find AWS credentials. Check with `aws sts get-caller-identity` on the agent, and set up one of the options in step 5. |
 | `curl: option --aws-sigv4: is unknown` | curl older than 7.75 on the Jenkins agent. |
 | `export-credentials` not found | AWS CLI older than 2.9. |
 
